@@ -1,11 +1,12 @@
 import argparse
 import os
 from contextlib import nullcontext
-
+import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
 from transparent_background import Remover
+import struct
 
 from spar3d.models.mesh import QUAD_REMESH_AVAILABLE, TRIANGLE_REMESH_AVAILABLE
 from spar3d.system import SPAR3D
@@ -17,6 +18,32 @@ def check_positive(value):
     if ivalue <= 0:
         raise argparse.ArgumentTypeError("%s is an invalid positive int value" % value)
     return ivalue
+
+def export_to_vertices_bin(mesh,output_dir, file_name = "vertices.bin"):
+    vertices = np.asanyarray(mesh.vertices,dtype=np.float32)
+    file_path = os.path.join(output_dir, file_name)
+
+    with open(file_path,'wb') as f:
+        f.write(struct.pack('I', vertices.ndim))
+        for d in vertices.shape:
+            f.write(struct.pack('I', d))
+        dtype_str = str(vertices.dtype)
+        f.write(struct.pack('I', len(dtype_str)))
+        f.write(dtype_str.encode('utf-8'))
+        f.write(vertices.tobytes())
+
+def export_to_faces_bin(mesh,output_dir, file_name = "faces.bin"):
+    faces = np.asanyarray(mesh.faces,dtype=np.int32)
+    file_path = os.path.join(output_dir, file_name)
+
+    with open(file_path,'wb') as f:
+        f.write(struct.pack('I', faces.ndim))
+        for d in faces.shape:
+            f.write(struct.pack('I', d))
+        dtype_str = str(faces.dtype)
+        f.write(struct.pack('I', len(dtype_str)))
+        f.write(dtype_str.encode('utf-8'))
+        f.write(faces.tobytes())
 
 
 if __name__ == "__main__":
@@ -30,6 +57,16 @@ if __name__ == "__main__":
         type=str,
         help=f"Device to use. If no CUDA/MPS-compatible device is found, the baking will fail. Default: '{get_device()}'",
     )
+
+
+    parser.add_argument(
+        "--reduction_count_type",
+        choices=["keep", "vertex", "faces"],
+        default="keep",
+        help="Vertex count type",
+    )
+
+    
     parser.add_argument(
         "--pretrained-model",
         default="stabilityai/stable-point-aware-3d",
@@ -62,6 +99,22 @@ if __name__ == "__main__":
             "This mode will reduce the VRAM consumption to roughly 7GB but in exchange "
             "the model will be slower. Default: False"
         ),
+    )
+    parser.add_argument(
+        "--bbox-width",
+        type=check_positive,
+        help="Bounding box width to scale the mesh. If not specified, the mesh will not be scaled.",
+    )
+
+    parser.add_argument(
+        "--bbox-height",
+        type=check_positive,
+        help="Bounding box height to scale the mesh. If not specified, the mesh will not be scaled.",
+    )
+    parser.add_argument(
+        "--bbox-depth",
+        type=check_positive,
+        help="Bounding box depth to scale the mesh. If not specified, the mesh will not be scaled.",
     )
 
     remesh_choices = ["none"]
@@ -170,6 +223,34 @@ if __name__ == "__main__":
                     vertex_count=vertex_count,
                     return_points=True,
                 )
+            # print(type(mesh))
+            # print(mesh.extents)
+            # print(mesh.units)
+
+            if args.bbox_width is None:
+                args.bbox_width = 1
+            if args.bbox_height is None:
+                args.bbox_height = 1
+            if args.bbox_depth is None:
+                args.bbox_depth = 1
+
+            x,y,z = mesh.extents
+
+            scale_x = args.bbox_width/x
+            scale_y = args.bbox_height / y
+            scale_z = args.bbox_depth / z
+
+            scale_factor = [scale_x,scale_y,scale_z]
+
+            print(f"Original mesh extents: x={x}, y={y}, z={z}")
+            print(f"Target bbox: width={args.bbox_width}, height={args.bbox_height}, depth={args.bbox_depth}")
+            print(f"Scale factors: x={scale_x}, y={scale_y}, z={scale_z}")
+
+            mesh.apply_scale(scale_factor)
+
+            new_x, new_y, new_z = mesh.extents
+            print(f"New mesh extents after scaling: x={new_x}, y={new_y}, z={new_z}")
+
         if torch.cuda.is_available():
             print("Peak Memory:", torch.cuda.max_memory_allocated() / 1024 / 1024, "MB")
         elif torch.backends.mps.is_available():
@@ -182,9 +263,16 @@ if __name__ == "__main__":
             mesh.export(out_mesh_path, include_normals=True)
             out_points_path = os.path.join(output_dir, str(i), "points.ply")
             glob_dict["point_clouds"][0].export(out_points_path)
+            
+            export_to_faces_bin(mesh=mesh,output_dir=output_dir)
+            export_to_vertices_bin(mesh=mesh,output_dir=output_dir)
+
+
         else:
             for j in range(len(mesh)):
                 out_mesh_path = os.path.join(output_dir, str(i + j), "mesh.glb")
                 mesh[j].export(out_mesh_path, include_normals=True)
                 out_points_path = os.path.join(output_dir, str(i + j), "points.ply")
                 glob_dict["point_clouds"][j].export(out_points_path)
+                export_to_faces_bin(mesh=mesh,output_dir=output_dir)
+                export_to_vertices_bin(mesh=mesh,output_dir=output_dir)
